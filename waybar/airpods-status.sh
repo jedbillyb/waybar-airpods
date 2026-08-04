@@ -114,12 +114,14 @@ jq -c '
     {text: "pods --", class: "off",
      tooltip: ($name + " disconnected\nclick to connect")}
   else
-    (if (pct("left") != null and pct("right") != null) then
-       (if pct("left") == pct("right") then "pods \(pct("left"))%"
-        else "pods \(pct("left"))/\(pct("right"))%" end)
-     elif pct("left") != null then "pods L \(pct("left"))%"
-     elif pct("right") != null then "pods R \(pct("right"))%"
-     else "pods on" end) as $text |
+    # Each component is labelled and shown separately, including when the two
+    # buds happen to match - collapsing them to one number hides which bud is
+    # which, and they diverge as soon as only one is in an ear. The case only
+    # appears when it actually reports (see the note in the README).
+    ([ (if pct("left")  != null then "L\(pct("left"))%"  else empty end),
+       (if pct("right") != null then "R\(pct("right"))%" else empty end),
+       (if pct("case")  != null then "C\(pct("case"))%"  else empty end)
+     ] | if length == 0 then "pods on" else "pods " + join(" ") end) as $text |
 
     ([ (if pct("left")  != null then "left  \(pct("left"))%  (\(st("left")))"   else empty end),
        (if pct("right") != null then "right \(pct("right"))%  (\(st("right")))" else empty end),

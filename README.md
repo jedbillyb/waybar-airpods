@@ -16,7 +16,18 @@ Verified working on Void Linux, BlueZ 5.86, AirPods 3rd generation
 
 - Left, right and case battery, each with charging / discharging state
 - In-ear detection
-- A waybar module that hides itself when the AirPods are not connected
+- A bar module that doubles as a connect toggle
+
+The bar reads `pods L100% R100%`, gaining ` C80%` when the case reports.
+
+**The case percentage is only available while a bud is sitting in the case.**
+The case has no radio of its own, it reports through a bud, so with both buds
+in your ears the AirPods send `case level=0 status=disconnected`. That is
+filtered out rather than shown as a real `C0%`. Put a bud back in with the lid
+open and the case figure appears.
+
+Likewise a bud that is in the case reports as disconnected, so the bar shows
+only the bud that is actually out.
 
 ## Layout
 
