@@ -83,8 +83,13 @@ class Bluez:
         )
         return reply.unpack()[0]
 
-    def find_airpods(self) -> tuple[str, str] | None:
-        """Return (address, name) of the first connected AirPods-like device."""
+    def find_airpods(self, require_connected: bool = True) -> tuple[str, str] | None:
+        """Return (address, name) of the first AirPods-like device.
+
+        With require_connected=False this also matches a paired but absent
+        device, which is how the bar learns the address to offer a connect
+        while the AirPods are off with a phone.
+        """
         try:
             objects = self._managed_objects()
         except GLib.Error as e:
@@ -93,7 +98,11 @@ class Bluez:
 
         for _path, interfaces in objects.items():
             dev = interfaces.get("org.bluez.Device1")
-            if not dev or not dev.get("Connected"):
+            if not dev:
+                continue
+            if require_connected and not dev.get("Connected"):
+                continue
+            if not require_connected and not dev.get("Paired"):
                 continue
             modalias = dev.get("Modalias", "")
             uuids = [u.lower() for u in dev.get("UUIDs", [])]
@@ -107,6 +116,10 @@ class State:
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
+        # Survives reset(): the bar needs something to click on, and something
+        # to label, while the AirPods are away with a phone.
+        self.last_address = None
+        self.last_name = None
         self.reset()
 
     def reset(self) -> None:
@@ -116,9 +129,19 @@ class State:
         self.battery = {}  # component -> {"level": int, "status": str}
         self.ear = None
 
+    def remember(self, address: str, name: str) -> bool:
+        """Record the device we would reconnect to. True if this changed anything."""
+        if (address, name) == (self.last_address, self.last_name):
+            return False
+        self.last_address = address
+        self.last_name = name
+        return True
+
     def as_dict(self) -> dict:
         return {
             "connected": self.connected,
+            "last_address": self.last_address,
+            "last_name": self.last_name,
             "name": self.name,
             "address": self.address,
             "battery": self.battery,
@@ -300,10 +323,20 @@ def main() -> int:
             found = bluez.find_airpods()
 
         if not found:
+            # Nothing connected. Learn the paired device anyway so the bar can
+            # label and offer a connect while the AirPods are with a phone.
+            paired = bluez.find_airpods(require_connected=False)
+            if paired:
+                with state.lock:
+                    changed = state.remember(*paired)
+                if changed:
+                    write_state(state)
             time.sleep(RETRY_DISCONNECTED)
             continue
 
         address, name = found
+        with state.lock:
+            state.remember(address, name)
         session(address, name, state)
         time.sleep(RETRY_ERROR)
 
