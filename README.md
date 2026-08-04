@@ -1,6 +1,7 @@
-# airpods-linux
+# waybar-airpods
 
-Per-bud and case battery for AirPods on Linux, published to waybar.
+waybar module showing per-bud and case AirPods battery, charging state and
+in-ear detection.
 
 BlueZ exposes no `Battery1` interface for AirPods. The only thing the standard
 stack can offer is a single combined percentage over HFP, and only while the
@@ -57,7 +58,7 @@ and put `"custom/airpods"` in `modules-right`. Start the daemon from your
 compositor config, e.g. in `~/.config/sway/config`:
 
 ```
-exec_always /mnt/shared/projects/airpods-linux/daemon/airpodsd
+exec_always /mnt/shared/projects/waybar-airpods/daemon/airpodsd
 ```
 
 ## How it works

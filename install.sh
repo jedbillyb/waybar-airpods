@@ -24,5 +24,5 @@ Still to do by hand:
   1. add "custom/airpods" to modules-right in ~/.config/waybar/config
   2. add the module definition (see README)
   3. start the daemon from your compositor config:
-       exec_always /mnt/shared/projects/airpods-linux/daemon/airpodsd
+       exec_always /mnt/shared/projects/waybar-airpods/daemon/airpodsd
 EOF
