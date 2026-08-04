@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""airpodsd - AirPods battery/ear-detection daemon for Linux.
+
+Speaks Apple's AACP (Apple Accessory Communication Protocol) over an L2CAP
+socket on PSM 0x1001, which is how AirPods report per-bud and case battery.
+BlueZ exposes no Battery1 interface for AirPods, so this is the only way to
+get the real numbers rather than the single combined value HFP can give.
+
+State is written as JSON to $XDG_RUNTIME_DIR/airpodsd/state.json and waybar is
+nudged with SIGRTMIN+11 on every change. See waybar/airpods-status.sh.
+
+Protocol reference: https://github.com/kavishdevar/librepods/tree/main/docs
+"""
+
+import errno
+import fcntl
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+import gi
+
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib  # noqa: E402
+
+PSM = 0x1001
+HDR = b"\x04\x00\x04\x00"
+
+# Captured from a macOS host with PacketLogger; see librepods docs/AAP Definitions.md
+HANDSHAKE = bytes.fromhex("00000400010002000000000000000000")
+SET_SPECIFIC_FEATURES = bytes.fromhex("040004004d00ff0000000000")
+REQUEST_NOTIFICATIONS = bytes.fromhex("040004000f00ffffffff")
+
+OP_BATTERY = 0x0004
+OP_EAR = 0x0006
+
+COMPONENT = {0x02: "right", 0x04: "left", 0x08: "case"}
+# 0x03 is undocumented but shows up in practice during in-case transitions.
+STATUS = {0x00: "unknown", 0x01: "charging", 0x02: "discharging", 0x04: "disconnected"}
+# 0x03 is not in the published tables. It is reported for a bud whose battery
+# simultaneously reads "disconnected", so it is treated as absent.
+EAR = {0x00: "in_ear", 0x01: "out_of_ear", 0x02: "in_case", 0x03: "disconnected"}
+
+# Apple's vendor ID, and the AACP service UUID AirPods advertise.
+APPLE_MODALIAS_PREFIX = "bluetooth:v004C"
+AACP_UUID = "74ec2172-0bad-4d01-8f77-997b2be0722a"
+
+RUNDIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "airpodsd")
+STATE_FILE = os.path.join(RUNDIR, "state.json")
+LOCK_FILE = os.path.join(RUNDIR, "lock")
+WAYBAR_SIGNAL = os.environ.get("AIRPODS_WAYBAR_SIGNAL", "RTMIN+11")
+
+RETRY_DISCONNECTED = 8.0  # seconds between BlueZ checks while nothing is connected
+RETRY_ERROR = 5.0  # seconds after a failed L2CAP attempt
+
+
+def log(msg: str) -> None:
+    print(f"[airpodsd] {msg}", flush=True)
+
+
+class Bluez:
+    """Minimal read-only BlueZ view over D-Bus, using Gio so we need no python-dbus."""
+
+    def __init__(self) -> None:
+        self.bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+
+    def _managed_objects(self) -> dict:
+        reply = self.bus.call_sync(
+            "org.bluez",
+            "/",
+            "org.freedesktop.DBus.ObjectManager",
+            "GetManagedObjects",
+            None,
+            GLib.VariantType("(a{oa{sa{sv}}})"),
+            Gio.DBusCallFlags.NONE,
+            5000,
+            None,
+        )
+        return reply.unpack()[0]
+
+    def find_airpods(self) -> tuple[str, str] | None:
+        """Return (address, name) of the first connected AirPods-like device."""
+        try:
+            objects = self._managed_objects()
+        except GLib.Error as e:
+            log(f"bluez query failed: {e.message}")
+            return None
+
+        for _path, interfaces in objects.items():
+            dev = interfaces.get("org.bluez.Device1")
+            if not dev or not dev.get("Connected"):
+                continue
+            modalias = dev.get("Modalias", "")
+            uuids = [u.lower() for u in dev.get("UUIDs", [])]
+            if modalias.startswith(APPLE_MODALIAS_PREFIX) and AACP_UUID in uuids:
+                return dev.get("Address", ""), dev.get("Alias") or dev.get("Name") or "AirPods"
+        return None
+
+
+class State:
+    """Current AirPods state, serialised to disk whenever it changes."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        self.connected = False
+        self.name = None
+        self.address = None
+        self.battery = {}  # component -> {"level": int, "status": str}
+        self.ear = None
+
+    def as_dict(self) -> dict:
+        return {
+            "connected": self.connected,
+            "name": self.name,
+            "address": self.address,
+            "battery": self.battery,
+            "ear": self.ear,
+            # ts only moves when something changes, so it cannot be used to
+            # detect a dead daemon - a stable reading is legitimately old. The
+            # pid lets the bar check we are still alive instead.
+            "pid": os.getpid(),
+            "ts": int(time.time()),
+        }
+
+
+def write_state(state: State) -> None:
+    """Atomically publish state and poke waybar."""
+    os.makedirs(RUNDIR, exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state.as_dict(), f)
+    os.replace(tmp, STATE_FILE)
+    # waybar reads the file on signal; failure here is not fatal (bar may be down).
+    subprocess.run(
+        ["pkill", f"-{WAYBAR_SIGNAL}", "-x", "waybar"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
+def parse_battery(payload: bytes) -> dict:
+    """04 00 04 00 04 00 [count] ([component] 01 [level] [status] 01) * count"""
+    if not payload:
+        return {}
+    count = payload[0]
+    out = {}
+    for i in range(count):
+        entry = payload[1 + i * 5 : 6 + i * 5]
+        if len(entry) < 5:
+            break
+        component = COMPONENT.get(entry[0])
+        status = STATUS.get(entry[3], f"unknown_{entry[3]:#04x}")
+        if component is None:
+            continue
+        # A disconnected component reports level 0, which is not a real reading -
+        # the case does this constantly while its lid is shut. Drop it so the bar
+        # never shows a phantom "case 0%".
+        if status == "disconnected":
+            continue
+        out[component] = {"level": entry[2], "status": status}
+    return out
+
+
+def parse_ear(payload: bytes) -> dict | None:
+    """04 00 04 00 06 00 [primary] [secondary]
+
+    The two bytes track the primary and secondary bud rather than left/right;
+    which bud is primary is chosen by the AirPods and is not reported here.
+    """
+    if len(payload) < 2:
+        return None
+    return {
+        "primary": EAR.get(payload[0], f"unknown_{payload[0]:#04x}"),
+        "secondary": EAR.get(payload[1], f"unknown_{payload[1]:#04x}"),
+    }
+
+
+def session(address: str, name: str, state: State) -> None:
+    """Hold one AACP session open, updating state until the link drops."""
+    sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP)
+    sock.settimeout(10)
+    try:
+        sock.connect((address, PSM))
+    except OSError as e:
+        log(f"l2cap connect to {address} failed: {e}")
+        sock.close()
+        return
+
+    log(f"connected to {name} ({address})")
+    try:
+        for pkt in (HANDSHAKE, SET_SPECIFIC_FEATURES, REQUEST_NOTIFICATIONS):
+            sock.send(pkt)
+            time.sleep(0.4)
+    except OSError as e:
+        log(f"handshake failed: {e}")
+        sock.close()
+        return
+
+    with state.lock:
+        state.connected = True
+        state.name = name
+        state.address = address
+    write_state(state)
+
+    sock.settimeout(None)
+    try:
+        while True:
+            data = sock.recv(1024)
+            if not data:
+                break
+            if not data.startswith(HDR) or len(data) < 6:
+                continue
+            opcode = int.from_bytes(data[4:6], "little")
+            payload = data[6:]
+            changed = False
+            if opcode == OP_BATTERY:
+                battery = parse_battery(payload)
+                with state.lock:
+                    if battery and battery != state.battery:
+                        state.battery = battery
+                        changed = True
+            elif opcode == OP_EAR:
+                ear = parse_ear(payload)
+                with state.lock:
+                    if ear and ear != state.ear:
+                        state.ear = ear
+                        changed = True
+            if changed:
+                write_state(state)
+    except OSError as e:
+        log(f"link dropped: {e}")
+    finally:
+        sock.close()
+
+    with state.lock:
+        state.reset()
+    write_state(state)
+    log("disconnected")
+
+
+def acquire_lock():
+    """Single-instance guard.
+
+    Sway starts this with exec_always, which fires again on every config
+    reload, and only one process can usefully hold the AACP link. Returning
+    the file object keeps the fd (and so the lock) alive for the process
+    lifetime; the kernel drops it automatically if we die.
+    """
+    os.makedirs(RUNDIR, exist_ok=True)
+    handle = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        if e.errno in (errno.EACCES, errno.EAGAIN):
+            return None
+        raise
+    return handle
+
+
+def main() -> int:
+    lock = acquire_lock()
+    if lock is None:
+        log("another airpodsd is already running, exiting")
+        return 0
+
+    state = State()
+    bluez = Bluez()
+
+    def shutdown(_signum, _frame):
+        with state.lock:
+            state.reset()
+        write_state(state)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    write_state(state)
+    log("started")
+
+    forced = os.environ.get("AIRPODS_ADDR")
+    while True:
+        found = None
+        if forced:
+            # Still require BlueZ to say it is connected, so we do not page a
+            # device that is asleep in its case every few seconds.
+            detected = bluez.find_airpods()
+            if detected and detected[0].upper() == forced.upper():
+                found = detected
+        else:
+            found = bluez.find_airpods()
+
+        if not found:
+            time.sleep(RETRY_DISCONNECTED)
+            continue
+
+        address, name = found
+        session(address, name, state)
+        time.sleep(RETRY_ERROR)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
